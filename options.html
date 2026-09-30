@@ -22,7 +22,7 @@
       <label class="row">
         <span>
           <strong>Catch links from other apps</strong>
-          <small>Links opened from Mail, Slack, Messages, etc. open in a Little window instead of a new tab. Works best with Helium set as your default browser.</small>
+          <small>Links opened from Raycast, Mail, Slack, Messages, etc. open in a Little window instead of a new tab. Works best with Helium set as your default browser.</small>
         </span>
         <input type="checkbox" name="catchExternal">
       </label>
@@ -43,6 +43,19 @@
           <option value="shift">⇧ Shift-click</option>
           <option value="alt-shift">⌥⇧ Option-Shift-click</option>
           <option value="off">Off</option>
+        </select>
+      </label>
+    </section>
+
+    <section>
+      <label class="row">
+        <span>
+          <strong>When Helium is full screen</strong>
+          <small>macOS won't let an extension float a window over a full-screen Space, and Helium opens every new window full screen while you're in one.</small>
+        </span>
+        <select name="fullscreenMode">
+          <option value="tab">Open a tab next to the current one</option>
+          <option value="window">Open a full-screen Little window</option>
         </select>
       </label>
     </section>

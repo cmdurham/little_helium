@@ -3,14 +3,17 @@
 // A Little window is a popup-type window (no tab strip, minimal chrome) that we
 // track by id. Links arriving from other apps are caught and moved into one;
 // "promote" moves the page into the most recently used main window.
+//
+// Macs can't float a window over a full-screen Space from an extension: Helium
+// forces every new window full screen while the active one is. So when the
+// relevant main window is full screen we can open a tab next to the current one
+// instead (the `fullscreenMode` setting).
 
 import { DEFAULTS, getSettings } from './settings.js';
 
 const START_PAGE = chrome.runtime.getURL('little.html');
-const STARTUP_GRACE_MS = 5000;   // ignore session-restore tabs right after launch
-const REFOCUS_WINDOW_MS = 1500;  // browser regained focus this recently => link likely came from another app
-const MIN_AWAY_MS = 250;         // shorter blur/focus blips are window switches inside the browser
-const CANDIDATE_TTL_MS = 3000;   // how long to wait for a URL on a tab created without one
+const STARTUP_GRACE_MS = 5000;   // ignore startup pages right after launch
+const NEW_WINDOW_MS = 3000;      // a window this young was opened just for the incoming link
 const CASCADE_PX = 28;
 
 // ---------------------------------------------------------------------------
@@ -19,24 +22,25 @@ const CASCADE_PX = 28;
 const state = {
   little: new Set(),   // ids of Little windows
   mru: [],             // normal window ids, most recently focused first
-  focused: true,       // does any browser window have OS focus?
-  blurAt: 0,
-  focusAt: 0,
   startupAt: 0,
   suppressUntil: 0,    // ignore tab creation we caused ourselves
 };
 
 const ready = chrome.storage.session.get('state').then(({ state: saved }) => {
   if (!saved) return;
-  Object.assign(state, saved, { little: new Set(saved.little) });
+  state.little = new Set(saved.little);
+  state.mru = saved.mru ?? [];
+  state.startupAt = saved.startupAt ?? 0;
+  state.suppressUntil = saved.suppressUntil ?? 0;
 });
 
 function persist() {
   chrome.storage.session.set({ state: { ...state, little: [...state.little] } });
 }
 
-// Tabs created with no URL yet that looked external when they were created.
-const candidates = new Map(); // tabId -> createdAt
+// When each window appeared, to tell a window Helium opened for an incoming link
+// from one the user already had.
+const windowBornAt = new Map();
 
 // ---------------------------------------------------------------------------
 // Lifecycle
@@ -65,32 +69,22 @@ function createMenus() {
 }
 
 // ---------------------------------------------------------------------------
-// Focus tracking
+// Focus tracking (which main window to promote into)
 
 chrome.windows.onFocusChanged.addListener(async (windowId) => {
+  if (windowId === chrome.windows.WINDOW_ID_NONE) return;
   await ready;
-  const now = Date.now();
-  if (windowId === chrome.windows.WINDOW_ID_NONE) {
-    if (state.focused) {
-      state.focused = false;
-      state.blurAt = now;
-    }
-  } else {
-    if (!state.focused) {
-      state.focused = true;
-      state.focusAt = now;
-    }
-    if (!state.little.has(windowId)) {
-      const win = await chrome.windows.get(windowId).catch(() => null);
-      if (win?.type === 'normal') {
-        state.mru = [windowId, ...state.mru.filter((id) => id !== windowId)];
-      }
-    }
-  }
+  if (state.little.has(windowId)) return;
+  const win = await chrome.windows.get(windowId).catch(() => null);
+  if (win?.type !== 'normal') return;
+  state.mru = [windowId, ...state.mru.filter((id) => id !== windowId)];
   persist();
 });
 
+chrome.windows.onCreated.addListener((win) => windowBornAt.set(win.id, Date.now()));
+
 chrome.windows.onRemoved.addListener(async (windowId) => {
+  windowBornAt.delete(windowId);
   await ready;
   state.little.delete(windowId);
   state.mru = state.mru.filter((id) => id !== windowId);
@@ -104,58 +98,62 @@ function isWebUrl(url) {
   return /^https?:\/\//i.test(url || '');
 }
 
-function looksExternal(tab) {
-  const now = Date.now();
-  if (tab.openerTabId !== undefined) return false;
-  if (state.little.has(tab.windowId)) return false;
-  if (now < state.suppressUntil) return false;
-  if (now - state.startupAt < STARTUP_GRACE_MS) return false;
-  if (!state.focused) return true;
-  return now - state.focusAt < REFOCUS_WINDOW_MS && state.focusAt - state.blurAt > MIN_AWAY_MS;
-}
-
-chrome.tabs.onCreated.addListener(async (tab) => {
+// Links handed to Helium by another app (Raycast, Mail, `open URL`…) commit with
+// the AUTO_TOPLEVEL transition, which the API reports as "start_page". Helium
+// sets the previously active tab as their opener, so the opener can't be used.
+// Startup pages share the transition, hence the grace period after launch.
+chrome.webNavigation.onCommitted.addListener(async ({ tabId, frameId, url, transitionType }) => {
+  if (frameId !== 0 || transitionType !== 'start_page' || !isWebUrl(url)) return;
   await ready;
-  if (!looksExternal(tab)) return;
+  const now = Date.now();
+  if (now - state.startupAt < STARTUP_GRACE_MS || now < state.suppressUntil) return;
   const { catchExternal } = await getSettings();
   if (!catchExternal) return;
 
-  const url = tab.pendingUrl || tab.url;
-  if (isWebUrl(url)) {
-    catchTab(tab, url);
-  } else if (!url) {
-    candidates.set(tab.id, Date.now());
-  }
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab || state.little.has(tab.windowId)) return;
+  // Already a tab in the full-screen window, which is where tab mode wants it.
+  if (await useTabInstead(tab.windowId)) return;
+  catchTab(tab, url);
 });
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  if (changeInfo.status !== 'complete') return;
   await ready;
-
-  if (changeInfo.url && candidates.has(tabId)) {
-    const fresh = Date.now() - candidates.get(tabId) < CANDIDATE_TTL_MS;
-    candidates.delete(tabId);
-    if (fresh && isWebUrl(changeInfo.url)) catchTab(tab, changeInfo.url);
-  }
-
-  if (changeInfo.status === 'complete' && state.little.has(tab.windowId)) {
-    injectOverlay(tabId);
-  }
+  if (state.little.has(tab.windowId)) injectOverlay(tabId);
 });
-
-chrome.tabs.onRemoved.addListener((tabId) => candidates.delete(tabId));
 
 async function catchTab(tab, url) {
   const bounds = await littleBounds();
+  const siblings = await chrome.tabs.query({ windowId: tab.windowId });
+  // Helium replaces a lone new-tab page with the link. Moving that tab out would
+  // close the user's window, so copy the URL and put a new-tab page back.
+  // If the service worker was asleep, the link's navigation can reach us before
+  // the window's onCreated does. Chromium numbers windows and tabs from one
+  // counter, so a window's very first tab has the id right after the window's.
+  const bornAt = windowBornAt.get(tab.windowId);
+  const openedForLink = (bornAt !== undefined && Date.now() - bornAt < NEW_WINDOW_MS)
+    || tab.id === tab.windowId + 1;
+  const wouldEmptyWindow = siblings.length === 1 && !openedForLink;
   let win;
   try {
+    if (wouldEmptyWindow) throw new Error('keep the window');
     // Moving the tab keeps it loading instead of starting over. If the tab was
     // alone in a window Helium just opened for it, that window closes itself.
     win = await chrome.windows.create({ tabId: tab.id, type: 'popup', focused: true, ...bounds });
   } catch {
     win = await chrome.windows.create({ url, type: 'popup', focused: true, ...bounds });
-    chrome.tabs.remove(tab.id).catch(() => {});
+    if (wouldEmptyWindow) chrome.tabs.update(tab.id, { url: 'chrome://newtab/' }).catch(() => {});
+    else chrome.tabs.remove(tab.id).catch(() => {});
   }
   await registerLittle(win);
+}
+
+async function useTabInstead(windowId) {
+  const { fullscreenMode } = await getSettings();
+  if (fullscreenMode !== 'tab') return false;
+  const win = await chrome.windows.get(windowId).catch(() => null);
+  return win?.type === 'normal' && win.state === 'fullscreen';
 }
 
 // ---------------------------------------------------------------------------
@@ -167,7 +165,19 @@ async function registerLittle(win) {
   for (const t of win.tabs ?? []) injectOverlay(t.id);
 }
 
-async function openLittle(url = START_PAGE, incognito = false) {
+async function openLittle(url = START_PAGE, source) {
+  const incognito = source?.incognito ?? false;
+  const anchor = source?.windowId ?? (await chrome.windows.getLastFocused().catch(() => null))?.id;
+  if (anchor !== undefined && await useTabInstead(anchor)) {
+    // Opener set so closing the tab returns to the one you came from.
+    return chrome.tabs.create({
+      windowId: anchor,
+      url: url === START_PAGE ? undefined : url,
+      index: source?.index !== undefined ? source.index + 1 : undefined,
+      openerTabId: source?.id,
+    });
+  }
+
   const bounds = await littleBounds();
   const opts = { url, type: 'popup', focused: true, ...bounds };
   // Incognito only works if the user allowed the extension there.
@@ -281,7 +291,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const tabId = msg.tabId ?? sender.tab?.id;
     switch (msg.type) {
       case 'open-little':
-        if (isWebUrl(msg.url)) await openLittle(msg.url, sender.tab?.incognito ?? false);
+        if (isWebUrl(msg.url)) await openLittle(msg.url, sender.tab);
         break;
       case 'promote':
         await promote(tabId);
@@ -303,7 +313,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 chrome.commands.onCommand.addListener(async (command, tab) => {
   await ready;
   if (command === 'open-little-window') {
-    openLittle(START_PAGE, tab?.incognito ?? false);
+    openLittle(START_PAGE, tab);
   } else if (command === 'promote-little-window') {
     const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
     if (active) promote(active.id);
@@ -312,11 +322,11 @@ chrome.commands.onCommand.addListener(async (command, tab) => {
   }
 });
 
-chrome.action.onClicked.addListener((tab) => openLittle(START_PAGE, tab?.incognito ?? false));
+chrome.action.onClicked.addListener((tab) => openLittle(START_PAGE, tab));
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   await ready;
-  if (info.menuItemId === 'open-link') openLittle(info.linkUrl, tab?.incognito ?? false);
+  if (info.menuItemId === 'open-link') openLittle(info.linkUrl, tab);
   else if (info.menuItemId === 'pop-out') popOut(tab);
   else if (info.menuItemId === 'settings') chrome.runtime.openOptionsPage();
 });

@@ -37,11 +37,19 @@ extension approximates them:
 - **Little window** = a Chromium `popup` window: no tab strip or toolbar, just a
   read-only address strip. The *Open in Helium* bar is injected into the page
   inside a closed shadow root.
-- **Links from other apps** are spotted with a heuristic. A new tab that has an
-  `http(s)` URL and no opener, created while Helium was in the background (or
-  within 1.5 s of it coming to the front), is treated as external. Tabs restored
-  at launch are ignored for the first 5 s. The trade-off is that a link that
-  *launches* Helium from a cold start opens as a normal tab.
+- **Links from other apps** (Raycast quicklinks, Mail, Slack, `open <url>`…)
+  are recognized by how Chromium labels them. A link handed over by the OS
+  commits with the `start_page` transition, which ordinary browsing never
+  produces. Startup pages share that label, so the first 5 s after launch are
+  ignored. As a result, a link that *launches* Helium from closed opens as a
+  normal tab.
+- **Full screen:** extensions can't float a window over a macOS full-screen
+  Space, and Helium opens every new window full screen while you're in one.
+  By default, while the main window is full screen, links open as a tab next
+  to the current one, and closing it returns you to where you were. The
+  options page can switch this to a full-screen Little window instead. For
+  real floating Little windows, maximize Helium (⌥-click the green button)
+  instead of going full screen.
 - **Promote** moves the tab into your most recently used main window. Chromium
   only moves tabs between normal windows, so when a move isn't allowed the URL is
   reopened. That reloads the page, so form input and scroll position are lost.
