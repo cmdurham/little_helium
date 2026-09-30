@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Little Window</title>
+  <link rel="icon" href="icons/icon32.png">
+  <link rel="stylesheet" href="little.css">
+</head>
+<body>
+  <main>
+    <form id="go" autocomplete="off">
+      <svg class="glass" viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5 14 14"/></svg>
+      <input id="q" type="text" placeholder="Search or enter URL" spellcheck="false" autofocus aria-label="Search or enter URL">
+    </form>
+    <p class="hints">
+      <span><kbd>↵</kbd> go</span>
+      <span><kbd>esc</kbd> close</span>
+      <span><kbd id="promote-key">⌥⇧O</kbd> open in Helium</span>
+    </p>
+  </main>
+  <script type="module" src="little.js"></script>
+</body>
+</html>

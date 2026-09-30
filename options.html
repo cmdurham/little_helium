@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Little Helium Settings</title>
+  <link rel="icon" href="icons/icon32.png">
+  <link rel="stylesheet" href="little.css">
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <main>
+    <header>
+      <img src="icons/icon128.png" alt="" width="40" height="40">
+      <div>
+        <h1>Little Helium</h1>
+        <p>Arc-style Little windows for quick links.</p>
+      </div>
+    </header>
+
+    <section>
+      <label class="row">
+        <span>
+          <strong>Catch links from other apps</strong>
+          <small>Links opened from Mail, Slack, Messages, etc. open in a Little window instead of a new tab. Works best with Helium set as your default browser.</small>
+        </span>
+        <input type="checkbox" name="catchExternal">
+      </label>
+      <label class="row">
+        <span>
+          <strong>Show the floating toolbar</strong>
+          <small>The “Open in Helium · copy link · close” bar at the top of Little windows.</small>
+        </span>
+        <input type="checkbox" name="showOverlay">
+      </label>
+      <label class="row">
+        <span>
+          <strong>Open links in a Little window with</strong>
+          <small>Takes effect in tabs loaded after the extension was installed.</small>
+        </span>
+        <select name="clickModifier">
+          <option value="alt">⌥ Option-click</option>
+          <option value="shift">⇧ Shift-click</option>
+          <option value="alt-shift">⌥⇧ Option-Shift-click</option>
+          <option value="off">Off</option>
+        </select>
+      </label>
+    </section>
+
+    <section>
+      <label class="row">
+        <span><strong>Position</strong></span>
+        <select name="position">
+          <option value="center">Center of screen</option>
+          <option value="top-right">Top-right corner</option>
+        </select>
+      </label>
+      <label class="row">
+        <span><strong>Width</strong></span>
+        <input type="number" name="width" min="360" max="3000" step="10"> 
+      </label>
+      <label class="row">
+        <span><strong>Height</strong></span>
+        <input type="number" name="height" min="300" max="2000" step="10">
+      </label>
+    </section>
+
+    <section>
+      <div class="row">
+        <span><strong>Keyboard shortcuts</strong></span>
+        <button id="shortcuts" type="button">Customize…</button>
+      </div>
+      <ul id="commands"></ul>
+    </section>
+
+    <p id="status" role="status"></p>
+  </main>
+  <script type="module" src="options.js"></script>
+</body>
+</html>
