@@ -1,5 +1,13 @@
 // Modifier-click a link (Option-click by default) to open it in a Little window.
+// Also records when the page was last shown or hidden, which the service worker
+// reads to tell whether you were in Helium when a link from another app arrived.
 (() => {
+  const noteVisibility = () => {
+    globalThis.__littleHeliumVisibility = { state: document.visibilityState, since: Date.now() };
+  };
+  noteVisibility();
+  document.addEventListener('visibilitychange', noteVisibility);
+
   let modifier = 'alt';
   chrome.storage.sync.get('clickModifier').then(({ clickModifier }) => {
     if (clickModifier) modifier = clickModifier;

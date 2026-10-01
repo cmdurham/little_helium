@@ -1,5 +1,6 @@
-// Injected into pages shown in a Little window: a small floating bar with
-// "Open in Helium", copy link and close, plus the ⌘O / ⌘⇧C shortcuts.
+// Injected into pages shown in a Little window: a small floating bar in the
+// top-right corner with "Open in Helium", copy link and hide, plus the ⌘O / ⌘⇧C
+// shortcuts (which keep working after the bar is hidden).
 (() => {
   if (window.top !== window || window.__littleHelium) return;
   window.__littleHelium = true;
@@ -15,7 +16,7 @@
   root.innerHTML = `
     <style>
       :host { all: initial; }
-      .wrap { display: flex; justify-content: center; padding-top: 10px; }
+      .wrap { display: flex; justify-content: flex-end; padding: 10px 12px 0 0; }
       .bar {
         pointer-events: auto;
         display: flex; align-items: center; gap: 2px;
@@ -73,7 +74,7 @@
           <svg viewBox="0 0 16 16"><path d="M6.5 9.5 9.5 6.5M7 4.5l1.2-1.2a2.5 2.5 0 0 1 3.5 3.5L10.5 8M9 11.5l-1.2 1.2a2.5 2.5 0 0 1-3.5-3.5L5.5 8"/></svg>
         </button>
         <span class="sep"></span>
-        <button class="icon" data-act="close" title="Close Little window">
+        <button class="icon" data-act="hide" title="Hide this bar (${mod}O still opens in Helium)">
           <svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg>
         </button>
       </div>
@@ -112,6 +113,7 @@
   root.addEventListener('click', (e) => {
     const act = e.target.closest('button')?.dataset.act;
     if (act === 'copy') copyLink();
+    else if (act === 'hide') hideBar();
     else if (act) send(act);
   });
 
@@ -125,8 +127,18 @@
     }, 2200);
   };
   bar.addEventListener('mouseleave', show);
-  document.addEventListener('mousemove', (e) => { if (e.clientY < 56) show(); }, { passive: true });
+  const revealNearTop = (e) => { if (e.clientY < 56) show(); };
+  document.addEventListener('mousemove', revealNearTop, { passive: true });
   show();
+
+  // ✕ dismisses the bar for this Little window (the background stops
+  // re-injecting it); the window itself stays open.
+  function hideBar() {
+    document.removeEventListener('mousemove', revealNearTop);
+    clearTimeout(hideTimer);
+    host.remove();
+    send('hide-bar');
+  }
 
   // SPA navigations change the URL without reloading the page.
   let lastHref = location.href;

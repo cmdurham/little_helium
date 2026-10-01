@@ -4,16 +4,24 @@
 // track by id. Links arriving from other apps are caught and moved into one;
 // "promote" moves the page into the most recently used main window.
 //
-// Macs can't float a window over a full-screen Space from an extension: Helium
-// forces every new window full screen while the active one is. So when the
-// relevant main window is full screen we can open a tab next to the current one
-// instead (the `fullscreenMode` setting).
+// Full screen: while its active window is full screen, Helium forces every new
+// window full screen too. Two workarounds, measured on macOS:
+// - created minimized and then restored, a window floats over the full-screen
+//   window on its Space (like Little Arc);
+// - allowed to go full screen and then set back to normal, it leaves the
+//   full-screen Space for a regular desktop.
+// A link from another app while you're on a different Space drags you onto
+// Helium's full-screen Space before we see it, so that case uses the second
+// trick to get you back to a desktop.
 
 import { DEFAULTS, getSettings } from './settings.js';
 
 const START_PAGE = chrome.runtime.getURL('little.html');
 const STARTUP_GRACE_MS = 5000;   // ignore startup pages right after launch
 const NEW_WINDOW_MS = 3000;      // a window this young was opened just for the incoming link
+const AWAY_HIDDEN_MS = 1500;     // your tab was hidden this long before a link => you were on another Space
+const REFOCUS_MS = 2000;         // fallback: Helium came forward this recently => the link pulled it forward
+const MIN_AWAY_MS = 250;         // shorter blur/focus blips are window switches inside Helium
 const CASCADE_PX = 28;
 
 // ---------------------------------------------------------------------------
@@ -22,20 +30,28 @@ const CASCADE_PX = 28;
 const state = {
   little: new Set(),   // ids of Little windows
   mru: [],             // normal window ids, most recently focused first
+  focused: true,       // does a Helium window have OS focus?
+  blurAt: 0,
+  focusAt: 0,
   startupAt: 0,
   suppressUntil: 0,    // ignore tab creation we caused ourselves
+  barHidden: new Set(), // Little windows whose floating bar the user dismissed
 };
 
 const ready = chrome.storage.session.get('state').then(({ state: saved }) => {
   if (!saved) return;
   state.little = new Set(saved.little);
+  state.barHidden = new Set(saved.barHidden ?? []);
   state.mru = saved.mru ?? [];
   state.startupAt = saved.startupAt ?? 0;
+  state.focused = saved.focused ?? true;
+  state.blurAt = saved.blurAt ?? 0;
+  state.focusAt = saved.focusAt ?? 0;
   state.suppressUntil = saved.suppressUntil ?? 0;
 });
 
 function persist() {
-  chrome.storage.session.set({ state: { ...state, little: [...state.little] } });
+  chrome.storage.session.set({ state: { ...state, little: [...state.little], barHidden: [...state.barHidden] } });
 }
 
 // When each window appeared, to tell a window Helium opened for an incoming link
@@ -54,6 +70,7 @@ chrome.runtime.onInstalled.addListener(async () => {
 chrome.runtime.onStartup.addListener(async () => {
   await ready;
   state.little.clear();
+  state.barHidden.clear();
   state.mru = [];
   state.startupAt = Date.now();
   persist();
@@ -69,15 +86,22 @@ function createMenus() {
 }
 
 // ---------------------------------------------------------------------------
-// Focus tracking (which main window to promote into)
+// Focus tracking: which main window to promote into, and whether Helium was in
+// the background when a link arrived.
 
 chrome.windows.onFocusChanged.addListener(async (windowId) => {
-  if (windowId === chrome.windows.WINDOW_ID_NONE) return;
   await ready;
-  if (state.little.has(windowId)) return;
-  const win = await chrome.windows.get(windowId).catch(() => null);
-  if (win?.type !== 'normal') return;
-  state.mru = [windowId, ...state.mru.filter((id) => id !== windowId)];
+  const now = Date.now();
+  if (windowId === chrome.windows.WINDOW_ID_NONE) {
+    if (state.focused) Object.assign(state, { focused: false, blurAt: now });
+    persist();
+    return;
+  }
+  if (!state.focused) Object.assign(state, { focused: true, focusAt: now });
+  if (!state.little.has(windowId)) {
+    const win = await chrome.windows.get(windowId).catch(() => null);
+    if (win?.type === 'normal') state.mru = [windowId, ...state.mru.filter((id) => id !== windowId)];
+  }
   persist();
 });
 
@@ -87,6 +111,7 @@ chrome.windows.onRemoved.addListener(async (windowId) => {
   windowBornAt.delete(windowId);
   await ready;
   state.little.delete(windowId);
+  state.barHidden.delete(windowId);
   state.mru = state.mru.filter((id) => id !== windowId);
   persist();
 });
@@ -102,7 +127,7 @@ function isWebUrl(url) {
 // the AUTO_TOPLEVEL transition, which the API reports as "start_page". Helium
 // sets the previously active tab as their opener, so the opener can't be used.
 // Startup pages share the transition, hence the grace period after launch.
-chrome.webNavigation.onCommitted.addListener(async ({ tabId, frameId, url, transitionType }) => {
+chrome.webNavigation.onCommitted.addListener(async ({ tabId, frameId, url, transitionType, timeStamp }) => {
   if (frameId !== 0 || transitionType !== 'start_page' || !isWebUrl(url)) return;
   await ready;
   const now = Date.now();
@@ -112,10 +137,31 @@ chrome.webNavigation.onCommitted.addListener(async ({ tabId, frameId, url, trans
 
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   if (!tab || state.little.has(tab.windowId)) return;
-  // Already a tab in the full-screen window, which is where tab mode wants it.
-  if (await useTabInstead(tab.windowId)) return;
-  catchTab(tab, url);
+  const away = await wasAway(tab, timeStamp);
+  lastCatch = { url, away, at: Date.now() };
+  catchTab(tab, url, away);
 });
+
+let lastCatch = null; // for debugging from the service worker console
+
+// Were you somewhere other than Helium (e.g. another Space) when the link came in?
+async function wasAway(tab, arrivedAt) {
+  // Best signal: the tab you'd been on (Helium makes it the opener) reports
+  // when it was last hidden. On another Space it was hidden the whole time;
+  // in Helium it only hid when the link's tab took over.
+  if (tab.openerTabId !== undefined) {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId: tab.openerTabId },
+      func: () => globalThis.__littleHeliumVisibility,
+    }).catch(() => []);
+    const vis = res?.result;
+    if (vis) return vis.state === 'hidden' && arrivedAt - vis.since > AWAY_HIDDEN_MS;
+  }
+  // Fallback (new-tab pages, pages loaded before install): Helium had lost
+  // focus and only came forward because of the link.
+  return !state.focused
+    || (arrivedAt - state.focusAt < REFOCUS_MS && state.focusAt - state.blurAt > MIN_AWAY_MS);
+}
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (changeInfo.status !== 'complete') return;
@@ -123,8 +169,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (state.little.has(tab.windowId)) injectOverlay(tabId);
 });
 
-async function catchTab(tab, url) {
-  const bounds = await littleBounds();
+async function catchTab(tab, url, away) {
   const siblings = await chrome.tabs.query({ windowId: tab.windowId });
   // Helium replaces a lone new-tab page with the link. Moving that tab out would
   // close the user's window, so copy the URL and put a new-tab page back.
@@ -135,25 +180,17 @@ async function catchTab(tab, url) {
   const openedForLink = (bornAt !== undefined && Date.now() - bornAt < NEW_WINDOW_MS)
     || tab.id === tab.windowId + 1;
   const wouldEmptyWindow = siblings.length === 1 && !openedForLink;
-  let win;
+  const context = { anchorWindowId: tab.windowId, away };
   try {
     if (wouldEmptyWindow) throw new Error('keep the window');
     // Moving the tab keeps it loading instead of starting over. If the tab was
     // alone in a window Helium just opened for it, that window closes itself.
-    win = await chrome.windows.create({ tabId: tab.id, type: 'popup', focused: true, ...bounds });
+    await createLittleWindow({ tabId: tab.id }, context);
   } catch {
-    win = await chrome.windows.create({ url, type: 'popup', focused: true, ...bounds });
+    await createLittleWindow({ url }, context);
     if (wouldEmptyWindow) chrome.tabs.update(tab.id, { url: 'chrome://newtab/' }).catch(() => {});
     else chrome.tabs.remove(tab.id).catch(() => {});
   }
-  await registerLittle(win);
-}
-
-async function useTabInstead(windowId) {
-  const { fullscreenMode } = await getSettings();
-  if (fullscreenMode !== 'tab') return false;
-  const win = await chrome.windows.get(windowId).catch(() => null);
-  return win?.type === 'normal' && win.state === 'fullscreen';
 }
 
 // ---------------------------------------------------------------------------
@@ -166,32 +203,62 @@ async function registerLittle(win) {
 }
 
 async function openLittle(url = START_PAGE, source) {
-  const incognito = source?.incognito ?? false;
-  const anchor = source?.windowId ?? (await chrome.windows.getLastFocused().catch(() => null))?.id;
-  if (anchor !== undefined && await useTabInstead(anchor)) {
-    // Opener set so closing the tab returns to the one you came from.
-    return chrome.tabs.create({
-      windowId: anchor,
-      url: url === START_PAGE ? undefined : url,
-      index: source?.index !== undefined ? source.index + 1 : undefined,
-      openerTabId: source?.id,
-    });
-  }
-
-  const bounds = await littleBounds();
-  const opts = { url, type: 'popup', focused: true, ...bounds };
+  const anchorWindowId = source?.windowId ?? (await chrome.windows.getLastFocused().catch(() => null))?.id;
+  const context = { anchorWindowId, away: false };
   // Incognito only works if the user allowed the extension there.
-  const win = await chrome.windows.create({ ...opts, incognito })
-    .catch(() => chrome.windows.create(opts));
-  await registerLittle(win);
-  return win;
+  return createLittleWindow({ url, incognito: source?.incognito ?? false }, context)
+    .catch(() => createLittleWindow({ url }, context));
 }
 
 async function popOut(tab) {
   if (!tab || state.little.has(tab.windowId)) return;
+  await createLittleWindow({ tabId: tab.id }, { anchorWindowId: tab.windowId, away: false });
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Is the main window you're working in (or the one a Little window sits over) full screen?
+async function inFullscreen(anchorWindowId) {
+  let id = anchorWindowId;
+  if (id === undefined || state.little.has(id)) id = state.mru[0];
+  const win = id === undefined ? null : await chrome.windows.get(id).catch(() => null);
+  return win?.state === 'fullscreen';
+}
+
+async function createLittleWindow(opts, { anchorWindowId, away }) {
   const bounds = await littleBounds();
-  const win = await chrome.windows.create({ tabId: tab.id, type: 'popup', focused: true, ...bounds });
+  if (!(await inFullscreen(anchorWindowId))) {
+    const win = await chrome.windows.create({ ...opts, type: 'popup', focused: true, ...bounds });
+    await registerLittle(win);
+    return win;
+  }
+  // See the note at the top: away => let it go full screen, then drop it back
+  // to a desktop; here => create it minimized, then restore it over full screen.
+  const win = await chrome.windows.create(away
+    ? { ...opts, type: 'popup', focused: true }
+    : { ...opts, type: 'popup', state: 'minimized' });
   await registerLittle(win);
+  await restoreToNormal(win.id, bounds);
+  return win;
+}
+
+// A restore requested too early is ignored: measured ~0.7 s for a new minimized
+// window, ~0.5 s for one entering full screen. Wait, ask, and re-ask if needed.
+const RESTORE_AFTER_MS = 900;
+
+async function restoreToNormal(windowId, bounds) {
+  await sleep(RESTORE_AFTER_MS);
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const win = await chrome.windows.get(windowId).catch(() => null);
+    if (!win) return;
+    if (win.state === 'normal') {
+      // Bounds only stick once the window is normal (a full-screen exit ignores them).
+      await chrome.windows.update(windowId, { ...bounds, focused: true }).catch(() => {});
+      return;
+    }
+    await chrome.windows.update(windowId, { state: 'normal', focused: true }).catch(() => {});
+    await sleep(700);
+  }
 }
 
 async function mainWindowFor(incognito) {
@@ -243,7 +310,7 @@ async function promote(tabId) {
 
 async function littleBounds() {
   await ready;
-  const { width, height, position } = await getSettings();
+  const { sizePercent, position } = await getSettings();
   let area;
   try {
     const displays = await chrome.system.display.getInfo();
@@ -256,11 +323,14 @@ async function littleBounds() {
   } catch {
     // system.display unavailable — let the browser place the window.
   }
-  if (!area) return { width, height };
+  if (!area) return {};
 
+  // sizePercent is a share of the screen's area, so scale both sides by its
+  // square root to keep the screen's proportions.
   const margin = 24;
-  const w = Math.min(width, area.width - margin * 2);
-  const h = Math.min(height, area.height - margin * 2);
+  const scale = Math.sqrt(Math.min(100, Math.max(20, sizePercent)) / 100);
+  const w = Math.min(area.width * scale, area.width - margin * 2);
+  const h = Math.min(area.height * scale, area.height - margin * 2);
   const shift = (state.little.size % 6) * CASCADE_PX;
 
   let left, top;
@@ -280,6 +350,8 @@ async function littleBounds() {
 async function injectOverlay(tabId) {
   const { showOverlay } = await getSettings();
   if (!showOverlay) return;
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab || state.barHidden.has(tab.windowId)) return;
   chrome.scripting.executeScript({ target: { tabId }, files: ['overlay.js'] }).catch(() => {
     // Restricted page (chrome://, web store, PDF viewer…) or not yet committed.
   });
@@ -296,9 +368,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case 'promote':
         await promote(tabId);
         break;
-      case 'close': {
-        const tab = await chrome.tabs.get(tabId);
-        if (state.little.has(tab.windowId)) await chrome.windows.remove(tab.windowId);
+      case 'hide-bar': {
+        const tab = await chrome.tabs.get(tabId).catch(() => null);
+        if (tab && state.little.has(tab.windowId)) {
+          state.barHidden.add(tab.windowId);
+          persist();
+        }
         break;
       }
     }
@@ -332,4 +407,4 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 });
 
 // Handy from the service worker's DevTools console.
-globalThis.littleHelium = { state, openLittle, popOut, promote, littleBounds };
+globalThis.littleHelium = { state, openLittle, popOut, promote, littleBounds, get lastCatch() { return lastCatch; } };
