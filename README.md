@@ -46,19 +46,11 @@ extension approximates them:
   ignored. As a result, a link that *launches* Helium from closed opens as a
   normal tab.
 - **Full screen:** while its active window is full screen, Helium opens every
-  new window full screen too. Little Helium works around this with two
-  behaviors measured on macOS:
-  - *You're in full-screen Helium* (⌥-click, shortcut, or a link from Raycast
-    while you're there): the Little window is created minimized and then
-    restored, which lets it float over the full-screen window like Little Arc.
-  - *You're on another Space* when a link arrives: Helium has already pulled
-    you onto its full-screen Space by the time the extension sees the link. The
-    Little window is allowed to go full screen and is then set back to normal,
-    which takes it, and you, back to a regular desktop.
-  To tell the two apart, it checks whether the tab you were on had been hidden
-  since before the link arrived. If that tab can't report, it checks whether
-  Helium only just came to the front. Expect about a second of window
-  animation in both cases.
+  new window full screen too. Little Helium works around this by creating the
+  Little window minimized and then restoring it, which lets it float over the
+  full-screen window like Little Arc (about a second of animation). This also
+  applies when a link from another app pulls you onto Helium's full-screen
+  Space.
 - **Other apps' full-screen Spaces:** a Little window can't appear over
   another app's full-screen Space (Claude, Zen, …). When Helium comes forward,
   macOS switches you to a Space with Helium's windows, and macOS won't place a
