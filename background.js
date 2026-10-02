@@ -15,6 +15,8 @@ const START_PAGE = chrome.runtime.getURL('little.html');
 const STARTUP_GRACE_MS = 5000;   // ignore startup pages right after launch
 const NEW_WINDOW_MS = 3000;      // a window this young was opened just for the incoming link
 const CASCADE_PX = 28;
+const HELPER = 'com.cmdurham.little_helium'; // optional native helper (install-helper.sh)
+const HELPER_TIMEOUT_MS = 600;
 
 // ---------------------------------------------------------------------------
 // State (mirrored to storage.session so it survives service-worker restarts)
@@ -119,11 +121,61 @@ chrome.webNavigation.onCommitted.addListener(async ({ tabId, frameId, url, trans
   catchTab(tab, url);
 });
 
-chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-  if (changeInfo.status !== 'complete') return;
+// ---------------------------------------------------------------------------
+// Keeping links inside Little windows
+
+// Add the page script as soon as each document (or frame) in a Little window
+// commits, so new-tab links are caught before the page finishes loading.
+chrome.webNavigation.onCommitted.addListener(async ({ tabId, frameId }) => {
   await ready;
-  if (state.little.has(tab.windowId)) injectOverlay(tabId);
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab || !state.little.has(tab.windowId)) return;
+  chrome.scripting.executeScript({
+    target: { tabId, frameIds: [frameId] },
+    files: ['little-page.js'],
+    injectImmediately: true,
+  }).catch(() => {});
 });
+
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  await ready;
+  if (changeInfo.url && strays.has(tabId)) {
+    const opener = strays.get(tabId);
+    strays.delete(tabId);
+    if (isWebUrl(changeInfo.url)) bringBack(tab, opener, changeInfo.url);
+  }
+  if (changeInfo.status === 'complete' && state.little.has(tab.windowId)) injectLittle(tabId);
+});
+
+// Fallback for new tabs a Little window's page opens some other way (script
+// window.open, forms): Chromium puts them in a main window and brings it to the
+// front. Load the URL in the Little window instead and put it back in front.
+// Popup windows (sign-in flows that need window.opener) are left alone.
+const strays = new Map(); // new tab id -> opener tab, while waiting for its URL
+
+chrome.tabs.onCreated.addListener(async (tab) => {
+  if (tab.openerTabId === undefined) return;
+  await ready;
+  const opener = await chrome.tabs.get(tab.openerTabId).catch(() => null);
+  if (!opener || !state.little.has(opener.windowId) || state.little.has(tab.windowId)) return;
+  const win = await chrome.windows.get(tab.windowId).catch(() => null);
+  if (win?.type !== 'normal') return;
+  const url = tab.pendingUrl || tab.url;
+  if (isWebUrl(url)) {
+    bringBack(tab, opener, url);
+  } else {
+    strays.set(tab.id, opener);
+    setTimeout(() => strays.delete(tab.id), 3000);
+  }
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => strays.delete(tabId));
+
+async function bringBack(tab, opener, url) {
+  await chrome.tabs.update(opener.id, { url }).catch(() => {});
+  await chrome.tabs.remove(tab.id).catch(() => {});
+  await chrome.windows.update(opener.windowId, { focused: true }).catch(() => {});
+}
 
 async function catchTab(tab, url) {
   const siblings = await chrome.tabs.query({ windowId: tab.windowId });
@@ -136,7 +188,7 @@ async function catchTab(tab, url) {
   const openedForLink = (bornAt !== undefined && Date.now() - bornAt < NEW_WINDOW_MS)
     || tab.id === tab.windowId + 1;
   const wouldEmptyWindow = siblings.length === 1 && !openedForLink;
-  const context = { anchorWindowId: tab.windowId };
+  const context = { anchorWindowId: tab.windowId, display: await sourceDisplay() };
   try {
     if (wouldEmptyWindow) throw new Error('keep the window');
     // Moving the tab keeps it loading instead of starting over. If the tab was
@@ -155,7 +207,7 @@ async function catchTab(tab, url) {
 async function registerLittle(win) {
   state.little.add(win.id);
   persist();
-  for (const t of win.tabs ?? []) injectOverlay(t.id);
+  for (const t of win.tabs ?? []) injectLittle(t.id);
 }
 
 async function openLittle(url = START_PAGE, source) {
@@ -173,19 +225,28 @@ async function popOut(tab) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Is the main window you're working in (or the one a Little window sits over) full screen?
-async function inFullscreen(anchorWindowId) {
+// The main window you're working in (or the one a Little window sits over).
+async function mainWindowUnder(anchorWindowId) {
   let id = anchorWindowId;
   if (id === undefined || state.little.has(id)) id = state.mru[0];
-  const win = id === undefined ? null : await chrome.windows.get(id).catch(() => null);
-  return win?.state === 'fullscreen';
+  return id === undefined ? null : chrome.windows.get(id).catch(() => null);
 }
 
-async function createLittleWindow(opts, { anchorWindowId }) {
-  const bounds = await littleBounds();
-  if (!(await inFullscreen(anchorWindowId))) {
+// `display`: where to put the window (the source app's display, from the
+// helper); otherwise the display of the window you last used.
+async function createLittleWindow(opts, { anchorWindowId, display }) {
+  const main = await mainWindowUnder(anchorWindowId);
+  const displays = await chrome.system.display.getInfo().catch(() => []);
+  const mainDisplay = main ? displayAt(displays, center(main)) : null;
+  const target = display ?? mainDisplay;
+  const bounds = await littleBounds(target);
+  const overFullscreen = main?.state === 'fullscreen' && (!display || display.id === mainDisplay?.id);
+
+  if (!overFullscreen) {
     const win = await chrome.windows.create({ ...opts, type: 'popup', focused: true, ...bounds });
     await registerLittle(win);
+    // On another display, Helium may still force it full screen; undo that.
+    if (win.state === 'fullscreen') await restoreToNormal(win.id, bounds);
     return win;
   }
   // See the note at the top: create it minimized, then restore it over full screen.
@@ -261,20 +322,39 @@ async function promote(tabId) {
 // ---------------------------------------------------------------------------
 // Geometry
 
-async function littleBounds() {
+const center = (r) => ({ x: r.left + r.width / 2, y: r.top + r.height / 2 });
+
+function displayAt(displays, { x, y }) {
+  return displays.find(({ bounds: b }) =>
+    x >= b.left && x < b.left + b.width && y >= b.top && y < b.top + b.height) ?? null;
+}
+
+// Which display is the app a link came from on? Asks the optional native
+// helper for the frontmost non-Helium window (or the cursor if there is none).
+// Returns null when the helper isn't installed or doesn't answer in time.
+async function sourceDisplay() {
+  const reply = await Promise.race([
+    chrome.runtime.sendNativeMessage(HELPER, { type: 'source-window' }).catch(() => null),
+    sleep(HELPER_TIMEOUT_MS).then(() => null),
+  ]);
+  if (!reply) return null;
+  const displays = await chrome.system.display.getInfo().catch(() => []);
+  return displayAt(displays, reply.window ? center(reply.window) : reply.cursor);
+}
+
+async function littleBounds(display) {
   await ready;
   const { sizePercent, position } = await getSettings();
-  let area;
-  try {
-    const displays = await chrome.system.display.getInfo();
-    const anchor = await chrome.windows.getLastFocused().catch(() => null);
-    const cx = anchor ? anchor.left + anchor.width / 2 : null;
-    const cy = anchor ? anchor.top + anchor.height / 2 : null;
-    const containing = displays.find(({ bounds: b }) =>
-      cx !== null && cx >= b.left && cx < b.left + b.width && cy >= b.top && cy < b.top + b.height);
-    area = (containing ?? displays.find((d) => d.isPrimary) ?? displays[0])?.workArea;
-  } catch {
-    // system.display unavailable — let the browser place the window.
+  let area = display?.workArea;
+  if (!area) {
+    try {
+      const displays = await chrome.system.display.getInfo();
+      const anchor = await chrome.windows.getLastFocused().catch(() => null);
+      const containing = anchor ? displayAt(displays, center(anchor)) : null;
+      area = (containing ?? displays.find((d) => d.isPrimary) ?? displays[0])?.workArea;
+    } catch {
+      // system.display unavailable — let the browser place the window.
+    }
   }
   if (!area) return {};
 
@@ -300,14 +380,17 @@ async function littleBounds() {
 // ---------------------------------------------------------------------------
 // Overlay injected into pages shown in Little windows
 
-async function injectOverlay(tabId) {
+// little-page.js always (links + shortcuts); the floating bar only if wanted.
+// Both guard against running twice. Failures mean a restricted page
+// (helium://, web store, PDF viewer…) or one that hasn't committed yet.
+async function injectLittle(tabId) {
+  await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['little-page.js'] })
+    .catch(() => {});
   const { showOverlay } = await getSettings();
   if (!showOverlay) return;
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   if (!tab || state.barHidden.has(tab.windowId)) return;
-  chrome.scripting.executeScript({ target: { tabId }, files: ['overlay.js'] }).catch(() => {
-    // Restricted page (chrome://, web store, PDF viewer…) or not yet committed.
-  });
+  chrome.scripting.executeScript({ target: { tabId }, files: ['overlay.js'] }).catch(() => {});
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -321,6 +404,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case 'promote':
         await promote(tabId);
         break;
+      case 'navigate-little': {
+        const tab = await chrome.tabs.get(tabId).catch(() => null);
+        if (tab && state.little.has(tab.windowId) && isWebUrl(msg.url)) await chrome.tabs.update(tabId, { url: msg.url });
+        break;
+      }
       case 'hide-bar': {
         const tab = await chrome.tabs.get(tabId).catch(() => null);
         if (tab && state.little.has(tab.windowId)) {
@@ -360,4 +448,4 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 });
 
 // Handy from the service worker's DevTools console.
-globalThis.littleHelium = { state, openLittle, popOut, promote, littleBounds };
+globalThis.littleHelium = { state, openLittle, popOut, promote, littleBounds, sourceDisplay, displayAt };

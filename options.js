@@ -29,6 +29,15 @@ document.getElementById('shortcuts').addEventListener('click', () => {
   chrome.tabs.create({ url: 'chrome://extensions/shortcuts' });
 });
 
+const helperStatus = document.getElementById('helper-status');
+chrome.runtime.sendNativeMessage('com.cmdurham.little_helium', { type: 'ping' })
+  .then(() => {
+    helperStatus.textContent = 'Helper installed. Links from other apps open on the display of the app you clicked them in.';
+  })
+  .catch(() => {
+    helperStatus.textContent = 'Helper not installed, so links open on the display of your last Helium window. To install it, run ./install-helper.sh in the extension folder, then reload the extension.';
+  });
+
 const list = document.getElementById('commands');
 for (const cmd of await chrome.commands.getAll()) {
   if (!cmd.description) continue;

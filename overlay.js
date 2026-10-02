@@ -1,6 +1,5 @@
-// Injected into pages shown in a Little window: a small floating bar in the
-// top-right corner with "Open in Helium", copy link and hide, plus the ⌘O / ⌘⇧C
-// shortcuts (which keep working after the bar is hidden).
+// Injected into pages shown in a Little window (after little-page.js): a small
+// floating bar in the top-right corner with "Open in Helium", copy link and hide.
 (() => {
   if (window.top !== window || window.__littleHelium) return;
   window.__littleHelium = true;
@@ -8,6 +7,7 @@
   const isMac = /Mac/.test(navigator.platform);
   const mod = isMac ? '⌘' : 'Ctrl+';
   const send = (type) => chrome.runtime.sendMessage({ type }).catch(() => {});
+  const copyLink = () => window.__littleHeliumCopyLink?.();
 
   const host = document.createElement('little-helium-bar');
   host.style.cssText = 'all:initial;position:fixed;inset:0 0 auto 0;z-index:2147483647;pointer-events:none;';
@@ -94,21 +94,13 @@
   favicon.onerror = () => { favicon.style.display = 'none'; };
   refreshHost();
 
-  const copyLink = async () => {
-    try {
-      await navigator.clipboard.writeText(location.href);
-    } catch {
-      const ta = document.createElement('textarea');
-      ta.value = location.href;
-      root.appendChild(ta);
-      ta.select();
-      document.execCommand('copy');
-      ta.remove();
-    }
+  // little-page.js does the copying (button or ⌘⇧C); show a check mark here.
+  window.addEventListener('little-helium:copied', () => {
     const original = copyBtn.innerHTML;
     copyBtn.innerHTML = '<svg viewBox="0 0 16 16"><path d="M3.5 8.5l3 3 6-7"/></svg>';
     setTimeout(() => { copyBtn.innerHTML = original; }, 1200);
-  };
+    show();
+  });
 
   root.addEventListener('click', (e) => {
     const act = e.target.closest('button')?.dataset.act;
@@ -148,22 +140,6 @@
       refreshHost();
     }
   }, 1000);
-
-  window.addEventListener('keydown', (e) => {
-    const primary = isMac ? e.metaKey : e.ctrlKey;
-    if (!primary || e.altKey) return;
-    const key = e.key.toLowerCase();
-    if (key === 'o' && !e.shiftKey) {
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      send('promote');
-    } else if (key === 'c' && e.shiftKey) {
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      copyLink();
-      show();
-    }
-  }, true);
 
   (document.body ?? document.documentElement).appendChild(host);
 })();

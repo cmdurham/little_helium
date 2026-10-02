@@ -9,6 +9,11 @@ into a main window with one keystroke.
 1. Open `helium://extensions` and turn on **Developer mode**.
 2. Click **Load unpacked** and pick this folder.
 3. Optional: make Helium your default browser so links from other apps go through it.
+4. Optional, for multiple displays: run `./install-helper.sh` in this folder,
+   then reload the extension. It compiles a small helper (needs Xcode's command
+   line tools) and registers it with Helium so Little windows open on the
+   display of the app a link came from. `./install-helper.sh --uninstall`
+   removes it.
 
 ## Use
 
@@ -56,6 +61,15 @@ extension approximates them:
   macOS switches you to a Space with Helium's windows, and macOS won't place a
   Helium window on another app's full-screen Space. Arc gets around this with a
   native window setting that extensions can't apply to Helium's windows.
+- **Links inside a Little window** stay in it. `target=_blank` links, and
+  ⌘-, ⇧- or middle-clicks, load in the same Little window instead of opening a
+  tab in the main window. Pages that open new tabs from script are redirected
+  back the same way. Sign-in popups (popup windows) are left alone.
+- **Display:** Chromium doesn't tell extensions which display another app is
+  on. The optional helper (`helper/little-helium-helper.swift`) reports the
+  frontmost window that isn't Helium's, which is the app you launched the link
+  from. Without the helper, Little windows open on the display of the Helium
+  window you last used.
 - **Promote** moves the tab into your most recently used main window. Chromium
   only moves tabs between normal windows, so when a move isn't allowed the URL is
   reopened. That reloads the page, so form input and scroll position are lost.
