@@ -1,12 +1,16 @@
-// Injected into every page (and frame) shown in a Little window, whether or
-// not the floating bar is on:
-// - links that would open a new tab (target=_blank, ⌘/⇧/middle-click) open in
-//   this Little window instead of popping the main window to the front;
-// - ⌘O opens the page in a main window, ⌘⇧C copies its link.
+// Injected into every page (and frame) of two kinds of windows. The background
+// sets window.__littleHeliumMode first.
+// - 'little' (a Little window, bar or not): links that would open a new tab
+//   (target=_blank, ⌘/⇧/middle-click) load in this Little window instead of
+//   popping the main window to the front; ⌘O opens the page in a main window,
+//   ⌘⇧C copies its link.
+// - 'app' (an installed web app): those same links open in a new Little window
+//   on the app's Space instead of a tab in the main window.
 // ⌥-click is left alone: it opens another Little window (link-click.js).
 (() => {
   if (window.__littleHeliumPage) return;
   window.__littleHeliumPage = true;
+  const mode = window.__littleHeliumMode || 'little';
 
   const isMac = /Mac/.test(navigator.platform);
   const isTop = window.top === window;
@@ -26,14 +30,15 @@
     if (!opensNewTab(e, link)) return;
     e.preventDefault();
     e.stopImmediatePropagation();
+    if (mode === 'app') send({ type: 'open-little', url: link.href });
     // A frame can't navigate a cross-origin top page, so let the extension do it.
-    if (isTop) location.href = link.href;
+    else if (isTop) location.href = link.href;
     else send({ type: 'navigate-little', url: link.href });
   };
   window.addEventListener('click', handle, true);
   window.addEventListener('auxclick', handle, true);
 
-  if (!isTop) return;
+  if (!isTop || mode !== 'little') return;
 
   const copyLink = async () => {
     try {

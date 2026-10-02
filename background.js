@@ -125,17 +125,29 @@ chrome.webNavigation.onCommitted.addListener(async ({ tabId, frameId, url, trans
 // Keeping links inside Little windows
 
 // Add the page script as soon as each document (or frame) in a Little window
-// commits, so new-tab links are caught before the page finishes loading.
+// or an installed web app commits, so new-tab links are caught early.
 chrome.webNavigation.onCommitted.addListener(async ({ tabId, frameId }) => {
   await ready;
   const tab = await chrome.tabs.get(tabId).catch(() => null);
-  if (!tab || !state.little.has(tab.windowId)) return;
-  chrome.scripting.executeScript({
-    target: { tabId, frameIds: [frameId] },
-    files: ['little-page.js'],
-    injectImmediately: true,
-  }).catch(() => {});
+  const mode = tab && await pageMode(tab);
+  if (mode) injectPageScript({ tabId, frameIds: [frameId] }, mode);
 });
+
+// 'little' for Little windows, 'app' for installed web apps (PWAs), else null.
+async function pageMode(tab) {
+  if (state.little.has(tab.windowId)) return 'little';
+  const win = await chrome.windows.get(tab.windowId).catch(() => null);
+  return win?.type === 'app' ? 'app' : null;
+}
+
+async function injectPageScript(target, mode) {
+  await chrome.scripting.executeScript({
+    target, injectImmediately: true, args: [mode],
+    func: (m) => { window.__littleHeliumMode = m; },
+  }).catch(() => {});
+  await chrome.scripting.executeScript({ target, injectImmediately: true, files: ['little-page.js'] })
+    .catch(() => {});
+}
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   await ready;
@@ -147,9 +159,10 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (changeInfo.status === 'complete' && state.little.has(tab.windowId)) injectLittle(tabId);
 });
 
-// Fallback for new tabs a Little window's page opens some other way (script
-// window.open, forms): Chromium puts them in a main window and brings it to the
-// front. Load the URL in the Little window instead and put it back in front.
+// Fallback for new tabs a Little window's or web app's page opens some other
+// way (script window.open, forms): Chromium puts them in a main window and
+// brings it to the front. From a Little window, load the URL there instead;
+// from a web app, move the tab into a new Little window on the app's Space.
 // Popup windows (sign-in flows that need window.opener) are left alone.
 const strays = new Map(); // new tab id -> opener tab, while waiting for its URL
 
@@ -157,9 +170,15 @@ chrome.tabs.onCreated.addListener(async (tab) => {
   if (tab.openerTabId === undefined) return;
   await ready;
   const opener = await chrome.tabs.get(tab.openerTabId).catch(() => null);
-  if (!opener || !state.little.has(opener.windowId) || state.little.has(tab.windowId)) return;
+  if (!opener || state.little.has(tab.windowId)) return;
   const win = await chrome.windows.get(tab.windowId).catch(() => null);
   if (win?.type !== 'normal') return;
+  if (await pageMode(opener) === 'app') {
+    const little = await createLittleWindow({ tabId: tab.id }, { anchorWindowId: opener.windowId });
+    keepInFront(little.id);
+    return;
+  }
+  if (!state.little.has(opener.windowId)) return;
   const url = tab.pendingUrl || tab.url;
   if (isWebUrl(url)) {
     bringBack(tab, opener, url);
@@ -174,7 +193,22 @@ chrome.tabs.onRemoved.addListener((tabId) => strays.delete(tabId));
 async function bringBack(tab, opener, url) {
   await chrome.tabs.update(opener.id, { url }).catch(() => {});
   await chrome.tabs.remove(tab.id).catch(() => {});
-  await chrome.windows.update(opener.windowId, { focused: true }).catch(() => {});
+  keepInFront(opener.windowId);
+}
+
+// Helium may bring its main window forward just after a Little window opens
+// (and macOS then switches you to the main window's Space). Re-focusing the
+// Little window a few times as that settles takes you back to it; when you're
+// already there, focusing it again does nothing visible.
+const REFOCUS_AT_MS = [0, 350, 900, 1800];
+
+function keepInFront(windowId) {
+  let last = 0;
+  for (const at of REFOCUS_AT_MS) {
+    setTimeout(() => chrome.windows.update(windowId, { focused: true }).catch(() => {}), at);
+    last = at;
+  }
+  return sleep(last);
 }
 
 async function catchTab(tab, url) {
@@ -193,9 +227,9 @@ async function catchTab(tab, url) {
     if (wouldEmptyWindow) throw new Error('keep the window');
     // Moving the tab keeps it loading instead of starting over. If the tab was
     // alone in a window Helium just opened for it, that window closes itself.
-    await createLittleWindow({ tabId: tab.id }, context);
+    keepInFront((await createLittleWindow({ tabId: tab.id }, context)).id);
   } catch {
-    await createLittleWindow({ url }, context);
+    keepInFront((await createLittleWindow({ url }, context)).id);
     if (wouldEmptyWindow) chrome.tabs.update(tab.id, { url: 'chrome://newtab/' }).catch(() => {});
     else chrome.tabs.remove(tab.id).catch(() => {});
   }
@@ -384,8 +418,7 @@ async function littleBounds(display) {
 // Both guard against running twice. Failures mean a restricted page
 // (helium://, web store, PDF viewer…) or one that hasn't committed yet.
 async function injectLittle(tabId) {
-  await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['little-page.js'] })
-    .catch(() => {});
+  await injectPageScript({ tabId, allFrames: true }, 'little');
   const { showOverlay } = await getSettings();
   if (!showOverlay) return;
   const tab = await chrome.tabs.get(tabId).catch(() => null);
@@ -399,7 +432,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const tabId = msg.tabId ?? sender.tab?.id;
     switch (msg.type) {
       case 'open-little':
-        if (isWebUrl(msg.url)) await openLittle(msg.url, sender.tab);
+        if (isWebUrl(msg.url)) keepInFront((await openLittle(msg.url, sender.tab)).id);
         break;
       case 'promote':
         await promote(tabId);

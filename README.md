@@ -65,6 +65,13 @@ extension approximates them:
   ⌘-, ⇧- or middle-clicks, load in the same Little window instead of opening a
   tab in the main window. Pages that open new tabs from script are redirected
   back the same way. Sign-in popups (popup windows) are left alone.
+- **Links in installed web apps** (Helium "apps"/PWAs) that would open a tab
+  in the main window open in a new Little window on the app's Space instead.
+  Links that stay within the app keep working as usual.
+- **Staying on your Space:** right after opening a Little window for a link,
+  Helium can bring its main window forward, and macOS then switches you to
+  the main window's Space. Little Helium re-focuses the Little window a few
+  times over the next ~2 s, which brings you back to it.
 - **Display:** Chromium doesn't tell extensions which display another app is
   on. The optional helper (`helper/little-helium-helper.swift`) reports the
   frontmost window that isn't Helium's, which is the app you launched the link
